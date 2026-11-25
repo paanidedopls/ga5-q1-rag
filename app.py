@@ -20,6 +20,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
+# Keep numerical runtimes from creating one worker pool per visible host CPU.
+# Render Free instances have very little CPU and memory available.
+for _thread_env in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_thread_env, "1")
+
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,9 +36,10 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 BASE_DIR = Path(__file__).resolve().parent
 KB_PATH = Path(os.getenv("KB_PATH", str(BASE_DIR / "knowledge_base.json")))
-MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+MODEL_NAME = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+FASTEMBED_THREADS = max(1, int(os.getenv("FASTEMBED_THREADS", "1")))
 BACKEND_SETTING = os.getenv("EMBEDDING_BACKEND", "auto").strip().lower()
-MAX_PARALLEL_REQUESTS = max(1, int(os.getenv("MAX_PARALLEL_REQUESTS", "16")))
+MAX_PARALLEL_REQUESTS = max(1, min(4, int(os.getenv("MAX_PARALLEL_REQUESTS", "4"))))
 MAX_QUESTION_CHARS = 2000
 
 # Words that normally signal the structure of a question rather than its subject.
@@ -104,7 +110,7 @@ class EmbeddingBackend:
             try:
                 from fastembed import TextEmbedding  # type: ignore
 
-                self.model = TextEmbedding(model_name=MODEL_NAME)
+                self.model = TextEmbedding(model_name=MODEL_NAME, threads=FASTEMBED_THREADS)
                 self.kind = "fastembed"
                 self.corpus_vectors = self._fastembed(corpus)
                 LOG.info("Loaded dense embedding model %s via FastEmbed", MODEL_NAME)
@@ -135,11 +141,15 @@ class EmbeddingBackend:
         return matrix / np.maximum(norms, 1e-12)
 
     def _fastembed(self, texts: list[str]) -> np.ndarray:
-        vectors = np.asarray(list(self.model.embed(texts)), dtype=np.float32)
+        vectors = np.asarray(list(self.model.embed(texts, batch_size=16)), dtype=np.float32)
         return self._normalize(vectors)
 
     def encode_query(self, question: str) -> np.ndarray:
         if self.kind == "fastembed":
+            # BGE models are trained with an instruction-style query prefix for
+            # asymmetric retrieval; passages remain unprefixed.
+            if MODEL_NAME.lower().startswith("baai/bge-small-en"):
+                question = "Represent this sentence for searching relevant passages: " + question
             return self._fastembed([question])[0]
         vector = self.vectorizer.transform([question]).toarray().astype(np.float32)
         return self._normalize(vector)[0]
@@ -480,6 +490,7 @@ class RAGService:
                 if sentence and not SUSPICIOUS_SENTENCE.search(sentence):
                     self.sentences.append(sentence)
                     self.sentence_to_passage.append(idx)
+        LOG.info("Loaded %d knowledge-base passages; initializing dense embedding backend", len(self.passages))
         self.backend = EmbeddingBackend(self.passages, self.sentences)
         self.passage_vectors = self.backend.corpus_vectors[: len(self.passages)]
         self.sentence_vectors = self.backend.corpus_vectors[len(self.passages) :]
@@ -761,6 +772,7 @@ request_slots = asyncio.Semaphore(MAX_PARALLEL_REQUESTS)
 async def lifespan(app: FastAPI):
     global service
     started = time.perf_counter()
+    LOG.info("Starting RAG service; embedding model=%s threads=%d", MODEL_NAME, FASTEMBED_THREADS)
     service = RAGService(KB_PATH)
     LOG.info("RAG service ready (backend=%s, startup=%.2fs)", service.backend.kind, time.perf_counter() - started)
     yield

@@ -1,37 +1,52 @@
-# GA5 Q1 — Render native Python deployment
+# GA5 Q1 — Render free-tier optimized native Python deployment
 
-This package deploys the FastAPI RAG service to Render as a native Python Web Service. It does **not** require Docker or local WSL.
+This version is configured for Render's 512 MB / low-CPU free web service. It does not require Docker or local WSL.
 
-## Files to put in a GitHub repository
+## Why this version is optimized
+
+- Uses `BAAI/bge-small-en-v1.5`, a compact 384-dimensional dense embedding model supported by FastEmbed (about 67 MB model files).
+- Restricts the ONNX Runtime session to one thread (`FASTEMBED_THREADS=1`).
+- Embeds the small corpus in batches of 16 to limit startup working memory.
+- Restricts concurrent API processing to four requests and uses one Uvicorn worker.
+- Caps common BLAS/OpenMP thread pools at one thread.
+- Uses an instruction prefix for BGE query embeddings.
+
+Model size reference: https://qdrant.github.io/fastembed/examples/Supported_Models/
+FastEmbed threads parameter: https://github.com/qdrant/fastembed/blob/main/fastembed/text/text_embedding.py
+
+## GitHub repository files
+
+Upload the contents of this folder to the repository root:
 
 - `app.py`
 - `knowledge_base.json`
 - `requirements.txt`
 - `.python-version`
-- `render.yaml` (optional Blueprint configuration)
+- `render.yaml`
 
-Do not add a Dockerfile to the Render repository. Render should use the native Python runtime.
+The `tests` folder is optional for deployment. Do not upload a Dockerfile.
 
 ## Deploy
 
-1. Create a GitHub repository and upload the files above to its root.
-2. In Render, choose **New → Blueprint** and select that GitHub repository, or choose **New → Web Service** and connect it.
-3. For a Web Service, select **Python** runtime, Free instance, build command `pip install -r requirements.txt`, and start command `uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1`.
-4. Set environment variables: `EMBEDDING_BACKEND=fastembed`, `EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2`, `MAX_PARALLEL_REQUESTS=16`.
-5. Wait for the deploy to become Live. The first startup downloads the embedding model and indexes the 50 passages.
-6. Check `/health`. It must return `status: ok`, `passages: 50`, and `embedding_backend: fastembed`.
-7. Submit the base HTTPS URL only, without `/query`.
+1. Push these files to the connected GitHub repository.
+2. In Render, use **Manual Deploy → Deploy latest commit** (or trigger a new deploy after connecting the repo).
+3. Keep the Free plan and allow the service to build and start.
+4. The first boot downloads the BGE-small model and embeds all 50 passages. This may take a few minutes on Render's free CPU.
+5. Check `/health`. It must return `status: ok`, `passages: 50`, and `embedding_backend: fastembed`.
+6. Test `POST /query` and confirm the response includes `answer`, `sources`, `scores`, and `confidence`.
+
+## Environment variables
+
+`render.yaml` declares all recommended memory/thread limits. Confirm these are applied in the Render service's Environment tab if you created the service manually rather than via Blueprint.
 
 ## Important free-tier caveat
 
-Render Free Web Services spin down after 15 minutes without inbound traffic. Waking a sleeping service can take about a minute, which may violate the assignment's 8-second response limit on the first request. Open `/health` immediately before triggering the exam probe; keep the service warm until all rounds finish. If the exam probe may occur more than 15 minutes later, a local server plus Cloudflare Tunnel is the safer no-cost alternative.
+Render Free Web Services have 512 MB RAM, spin down after 15 minutes of inactivity, and can take about one minute to wake. Keep the service warm immediately before the exam probe. A cold start can violate an 8-second first-request requirement.
 
-## API
+## Endpoints
 
-`POST /query` with JSON body:
+- `GET /health`
+- `POST /query`
+- `GET /docs`
 
-```json
-{"question":"What quorum does Raft require?","top_k":3}
-```
-
-`GET /health` reports readiness and the active embedding backend.
+Use the service base URL in the exam submission, without `/query`.

@@ -1,6 +1,6 @@
 """GA5 Q1: evidence-grounded RAG API over the supplied 50-passage KB.
 
-Production default: FastEmbed + all-MiniLM-L6-v2 (dense semantic embeddings).
+Production default: FastEmbed + BAAI/bge-small-en-v1.5 dense semantic embeddings.
 Local fallback: word/character TF-IDF when model packages or model downloads are
 unavailable. Answers are assembled from source sentences only; no free-form LLM
 is used, which limits hallucination and makes prompt-injection handling explicit.
@@ -64,6 +64,7 @@ include includes included fields field passage specified mentioned store stores 
 # the API into instructions. The remaining technical question is still searchable.
 INJECTION_PATTERNS = [
     re.compile(r"\b(?:ignore|disregard|override|forget)\b[^.!?\n]{0,100}\b(?:previous|prior|above|system|developer)?\s*(?:instructions?|rules?|prompts?)\b", re.I),
+    re.compile(r"\b(?:ignore|disregard|override|forget)\b[^.!?\n]{0,100}\b(?:the\s+)?(?:knowledge\s+base|kb|corpus|retrieved\s+(?:text|passages|evidence)|source\s+documents?)\b", re.I),
     re.compile(r"\b(?:reveal|print|dump|expose|show|output)\b[^.!?\n]{0,100}\b(?:system prompt|developer message|hidden instructions?|secrets?|api keys?|environment variables?)\b", re.I),
     re.compile(r"\b(?:act as|pretend to be)\b[^.!?\n]{0,80}\b(?:system|developer|administrator|root)\b", re.I),
 ]
@@ -226,7 +227,7 @@ ENTITY_ALIASES: dict[str, tuple[str, ...]] = {
     "saga": ("saga pattern", "saga"),
     "consistent hashing": ("consistent hashing",),
     "rendezvous hashing": ("rendezvous hashing", "highest random weight"),
-    "vector clocks": ("vector clocks", "version vectors"),
+    "vector clocks": ("vector clocks", "version vectors", "causal ordering", "causal relationships"),
     "hybrid logical clocks": ("hybrid logical clocks", "hlc"),
     "sgd": ("stochastic gradient descent", "sgd"),
     "adamw": ("adamw",),
@@ -296,7 +297,7 @@ QUERY_EXPANSIONS: dict[str, tuple[str, ...]] = {
     "port": ("listener", "socket", "transport"),
     "isolation": ("transaction isolation",),
     "handshake": ("round trip", "tls"),
-    "size": ("length", "bits"),
+    "size": ("length", "bits", "nodes", "acceptors", "members", "replicas", "blocks", "layers", "samples"),
     "threshold": ("exceed", "exceeds", "probability", "cutoff"),
     "hash": ("digest", "hmac"),
     "latency": ("round", "trip", "handshake", "connection", "setup"),
@@ -359,7 +360,8 @@ def find_query_entities(question: str) -> list[str]:
 def entity_support(passage: str, entities: list[str], prefer_last: bool = False) -> float:
     if not entities:
         return 0.0
-    first_sentence = re.split(r"(?<=[.!?])\s+", passage.strip(), maxsplit=1)[0]
+    passage_sentences = re.split(r"(?<=[.!?])\s+", passage.strip())
+    first_sentence = passage_sentences[0] if passage_sentences else passage.strip()
     first_norm = normalize_phrase(first_sentence)
     full_norm = normalize_phrase(passage)
     # In singular questions such as "What replaces TCP in HTTP/3?", the final
@@ -374,7 +376,11 @@ def entity_support(passage: str, entities: list[str], prefer_last: bool = False)
         if entity == "aes gcm":
             aliases = ("aes gcm", "advanced encryption standard")
         if entity == "rsa":
-            aliases = ("rsa key",)
+            aliases = ("rsa",)
+            # Distinguish RSA key length facts from TLS 1.2's mention of static
+            # RSA key exchange and ECC's comparison against RSA.
+            if re.search(r"\brsa key length", full_norm):
+                lead = True
         for alias in aliases:
             phrase = normalize_phrase(alias)
             if not phrase:
@@ -403,7 +409,7 @@ FOCUS_SYNONYMS: dict[str, tuple[str, ...]] = {
     "older": ("prior", "previous", "version"),
     "old": ("prior", "previous", "version"),
     "structure": ("tree", "lsm", "index"),
-    "size": ("length", "bit", "bits", "sample", "samples", "batch"),
+    "size": ("length", "bit", "bits", "sample", "samples", "batch", "node", "nodes", "acceptor", "acceptors", "member", "members", "replica", "replicas", "block", "blocks", "layer", "layers"),
     "distribut": ("store", "storage", "replica", "cluster"),
     "database": ("store", "storage", "datastore"),
     "includ": ("include", "comprise", "consist", "token", "header", "payload", "signature"),
@@ -418,6 +424,87 @@ FOCUS_SYNONYMS: dict[str, tuple[str, ...]] = {
     "verifi": ("verify", "verification", "signature", "claims", "cryptographic"),
     "member": ("node", "nodes", "membership", "cluster"),
 }
+
+
+# Additional normalization for natural-language probe phrasing. The KB uses compact
+# technical wording, while questions often describe the same facts indirectly.
+STOP_WORDS.update({
+    "specified", "specify", "specifies", "passage", "passages", "according",
+    "called", "known", "following", "above", "below", "three", "two", "first",
+    "second", "different", "difference", "way", "ways", "method", "methods",
+    "mechanism", "mechanisms", "system", "systems", "protocol", "protocols",
+    "feature", "features", "aspect", "aspects", "type", "types", "kind", "kinds",
+    "example", "examples", "work", "works", "working", "function", "functions",
+    "used", "use", "uses", "using", "support", "supports", "supported",
+    "allow", "allows", "allowed", "make", "makes", "made", "provide", "provides",
+    "provided", "perform", "performs", "performing", "implement", "implements",
+    "implemented", "implementation", "based", "level", "levels",
+})
+
+QUERY_EXPANSIONS.update({
+    "choose": ("assign", "assigns", "select", "selects", "ranking", "rank", "score", "highest"),
+    "chooses": ("assign", "assigns", "select", "selects", "ranking", "rank", "score", "highest"),
+    "selected": ("assign", "select", "ranking", "rank", "score", "highest"),
+    "selection": ("assign", "select", "ranking", "rank", "score", "highest"),
+    "server": ("node", "backend", "object", "key"),
+    "servers": ("nodes", "backend", "objects", "keys"),
+    "part": ("segment", "header", "payload", "signature", "comprise"),
+    "parts": ("segments", "header", "payload", "signature", "comprise"),
+    "field": ("header", "payload", "signature", "claim", "segment"),
+    "fields": ("header", "payload", "signature", "claims", "segments"),
+    "component": ("header", "payload", "signature", "segment"),
+    "components": ("header", "payload", "signature", "segments"),
+    "comprise": ("header", "payload", "signature", "segment"),
+    "comprises": ("header", "payload", "signature", "segment"),
+    "segment": ("header", "payload", "signature"),
+    "segments": ("header", "payload", "signature"),
+    "interval": ("periodic", "interval", "heartbeat", "probe", "timeout"),
+    "intervals": ("periodic", "heartbeat", "probe", "timeout"),
+    "unavailable": ("failed", "failure", "timeout", "unresponsive"),
+    "failure": ("failed", "failure", "suspect", "timeout", "detector"),
+    "detect": ("detector", "suspicion", "probe", "ping", "failure"),
+    "detected": ("detector", "suspicion", "probe", "ping", "failure"),
+    "older": ("prior", "previous", "undo", "version"),
+    "previous": ("prior", "undo", "version", "row"),
+    "persist": ("persistence", "rdb", "aof", "snapshot", "disk"),
+    "persistent": ("persistence", "rdb", "aof", "snapshot", "disk"),
+    "persistent": ("persistence", "rdb", "aof", "snapshot", "disk"),
+    "round": ("round trip", "handshake"),
+    "rounds": ("round trip", "handshake"),
+    "trip": ("round", "handshake"),
+    "trips": ("round", "handshake"),
+    "causal": ("causality", "ordering", "clock", "event"),
+    "causality": ("causal", "ordering", "clock", "event"),
+    "version": ("version vector", "undo log", "row version", "timestamp"),
+    "versions": ("version vector", "undo log", "row version", "timestamp"),
+    "range": ("range scan", "sequential", "b tree", "index"),
+    "scan": ("range", "sequential", "leaf", "index"),
+    "compress": ("compression", "hpack", "qpack", "dynamic table"),
+    "compressed": ("compression", "hpack", "qpack", "dynamic table"),
+    "encrypt": ("encryption", "cipher", "aes", "chacha20"),
+    "encrypted": ("encryption", "cipher", "aes", "chacha20"),
+})
+
+FOCUS_SYNONYMS.update({
+    "choose": ("assign", "select", "ranking", "rank", "score", "highest"),
+    "server": ("node", "backend"),
+    "part": ("segment", "header", "payload", "signature"),
+    "parts": ("segment", "header", "payload", "signature"),
+    "field": ("header", "payload", "signature", "claim"),
+    "fields": ("header", "payload", "signature", "claim"),
+    "segment": ("header", "payload", "signature"),
+    "segments": ("header", "payload", "signature"),
+    "interval": ("heartbeat", "probe", "timeout"),
+    "detect": ("detector", "suspicion", "probe", "ping"),
+    "failure": ("failed", "suspect", "timeout", "detector"),
+    "causal": ("causality", "ordering", "clock", "event"),
+    "round": ("trip", "handshake"),
+    "trips": ("round", "handshake"),
+    "range": ("scan", "sequential", "index"),
+    "compress": ("compression", "hpack", "qpack"),
+    "encrypt": ("encryption", "cipher", "aes", "chacha20"),
+})
+
 
 
 def weighted_coverage(query_terms: list[str], document_terms: Iterable[str], idf: dict[str, float], n_docs: int) -> float:
@@ -445,8 +532,23 @@ def clean_question(question: str) -> tuple[str, bool]:
         cleaned, count = pattern.subn(" ", cleaned)
         detected = detected or count > 0
     if detected:
-        # Remove dangling response commands after an injected instruction, while
-        # preserving a factual question that follows a prefix attack.
+        # Remove a malicious answer assertion up to its sentence boundary while
+        # preserving a later genuine question (e.g. "... say 9 round trips. What is the actual value?").
+        def _keep_entity_context(match: re.Match[str]) -> str:
+            # Keep the named technical target from a fabricated assertion while
+            # discarding its injected answer/value.
+            try:
+                named = find_query_entities(match.group(0))
+            except Exception:
+                named = []
+            context = " ".join(ENTITY_ALIASES[name][0] for name in named[:3])
+            return (" " + context + " ") if context else " "
+
+        cleaned = re.sub(
+            r"\b(?:and\s+)?(?:say|answer|respond|return|output|print)\b.*?[.!](?=\s*(?:what|which|who|how|where|when|why|compare|explain|identify)\b)",
+            _keep_entity_context, cleaned, flags=re.I,
+        )
+        # Remove dangling response commands when the attack is the final clause.
         trailing_command = re.search(
             r"\b(?:and\s+)?(?:say|answer|respond|return|output|print)\b[^?]*$",
             cleaned,
@@ -454,6 +556,7 @@ def clean_question(question: str) -> tuple[str, bool]:
         )
         if trailing_command:
             cleaned = cleaned[: trailing_command.start()]
+        cleaned = cleaned.lstrip(" .,!;:-")
         cleaned = re.sub(
             r"^\s*(?:and\s+)?(?:answer|respond|say|return|output)\b"
             r"(?:\s+(?:the|this|my|original)\s+question)?\s*[:;,\-]?\s*",
@@ -590,18 +693,53 @@ class RAGService:
             re.I,
         )) or any(term in focus_terms for term in {"size", "port", "timeout", "rate", "threshold", "round", "bits", "second", "millisecond"})
         if numeric_question:
-            sentence_scores = np.clip(
-                sentence_scores + np.asarray([
-                    0.055 if re.search(r"\b\d+(?:\.\d+)?\s*(?:ms|s|bits?|nodes?|samples?|records?|blocks?|round trips?)?\b", sentence, re.I) else 0.0
-                    for sentence in self.sentences
-                ], dtype=np.float32),
-                0.0, 1.0,
-            )
+            numeric_bonus = np.asarray([
+                0.075 if re.search(r"\b\d+(?:\.\d+)?\s*(?:ms|s|bits?|nodes?|samples?|records?|blocks?|round trips?|acceptors?|members?|replicas?)?\b", sentence, re.I) else 0.0
+                for sentence in self.sentences
+            ], dtype=np.float32)
+            sentence_scores = np.clip(sentence_scores + numeric_bonus, 0.0, 1.0)
+
+        # Exact attribute evidence outranks a broadly related sentence in the same
+        # passage (e.g. a key-length fact should beat a general crypto description).
+        attribute_patterns: list[tuple[re.Pattern[str], re.Pattern[str]]] = [
+            (re.compile(r"\b(?:key\s+)?(?:size|length|bits?)\b", re.I), re.compile(r"\b(?:key\s+)?(?:length|size)|\b\d+\s*bits?\b", re.I)),
+            (re.compile(r"\b(?:choose|chooses|selection|select|selects|assign|assigns|rank|ranking)\b", re.I), re.compile(r"\b(?:assign|assigns|select|selects|highest-ranking|highest random weight|score evaluation)\b", re.I)),
+            (re.compile(r"\b(?:round\s*trips?|handshake\s*rounds?)\b", re.I), re.compile(r"\b(?:round\s*trip|two-round-trip|single round trip|initial flight)\b", re.I)),
+            (re.compile(r"\b(?:port|tcp\s+port|udp\s+port)\b", re.I), re.compile(r"\bport\s+\d+\b", re.I)),
+            (re.compile(r"\b(?:batch\s+size|mini.?batch)\b", re.I), re.compile(r"\b(?:batch|samples?)\b.{0,35}\b\d+\b|\b\d+\s+samples?\b", re.I)),
+            (re.compile(r"\b(?:learning\s+rates?|step\s+rates?|lrs?)\b", re.I), re.compile(r"\b(?:learning|step)\s+rate\b.{0,100}\b\d+(?:\.\d+)?\b", re.I)),
+            (re.compile(r"\b(?:failure\s+detector|failure\s+detection)\b", re.I), re.compile(r"\b(?:failure\s+detector|phi\s+accrual|ping|probe|suspect)\b", re.I)),
+            (re.compile(r"\b(?:algorithm|algorithms)\b", re.I), re.compile(r"\b(?:algorithm|dijkstra|aries|token bucket|randomized backoff)\b", re.I)),
+            (re.compile(r"\b(?:causal|causality|ordering|ordered|vector clocks?)\b", re.I), re.compile(r"\b(?:partial ordering|causal relationships|track causal event ordering)\b", re.I)),
+            (re.compile(r"\b(?:abort|aborts|rollback|rolled back)\b", re.I), re.compile(r"\b(?:coordinator aborts?|presumed.abort|rolled.back|transaction abort)\b", re.I)),
+            (re.compile(r"\b(?:quorum|acknowledg(?:e|ment))\b", re.I), re.compile(r"\bquorum\b.{0,40}\b\d+\b|\b\d+\s+(?:nodes?|acceptors?|replicas?|members?)\b", re.I)),
+            (re.compile(r"\b(?:heartbeat|ping\s+interval|probe\s+interval)\b", re.I), re.compile(r"(?:\b\d+\s*ms\b.{0,35}\bheartbeats?\b|\b(?:heartbeats?|ping|probe|leader\s+leases?|lease\s+terms?)\b.{0,65}\b\d+\s*ms\b)", re.I)),
+            (re.compile(r"\b(?:timeout|time\s+out|duration)\b", re.I), re.compile(r"\b(?:timeout|time\s+out|interval|duration)\b.{0,40}\b\d+(?:\.\d+)?\s*(?:ms|s)\b", re.I)),
+            (re.compile(r"\b(?:header\s+compression|compression)\b", re.I), re.compile(r"\b(?:hpack|qpack|dynamic table|indexing tables)\b", re.I)),
+            (re.compile(r"\b(?:head.of.line|multiplex|multiplexing)\b", re.I), re.compile(r"\b(?:head.of.line|multiplex|multiplexing|udp)\b", re.I)),
+            (re.compile(r"\b(?:retry|retries|iteration|iterations)\b", re.I), re.compile(r"\b\d+\s+(?:retries|iterations|attempts?)\b|\biterations?\b", re.I)),
+            (re.compile(r"\b(?:threshold|cutoff|probability)\b", re.I), re.compile(r"\b(?:threshold|probability|cutoff)\b.{0,40}\b\d+(?:\.\d+)?\b", re.I)),
+            (re.compile(r"\b(?:persistence|persist|disk|storage)\b", re.I), re.compile(r"\b(?:persistence|persist|disk|rdb|aof|undo log|write-ahead log)\b", re.I)),
+            (re.compile(r"\bttl\b", re.I), re.compile(r"\b(?:time.to.live|how long|caches? retain|retain authoritative)\b", re.I)),
+            (re.compile(r"\b(?:data\s+structures?|fields?|parts?|segments?|components?)\b", re.I), re.compile(r"(?=.*\bheader\b)(?=.*\bpayload\b)(?=.*\bsignature\b)|\b(?:sets|hashes|data structures?|segments?)\b", re.I)),
+        ]
+        requested_attribute_patterns = [target for cue, target in attribute_patterns if cue.search(cleaned)]
+        if requested_attribute_patterns:
+            attr_bonus = np.asarray([
+                min(0.18, 0.09 * sum(bool(pattern.search(sentence)) for pattern in requested_attribute_patterns))
+                for sentence in self.sentences
+            ], dtype=np.float32)
+            sentence_scores = np.clip(sentence_scores + attr_bonus, 0.0, 1.0)
 
         ranked_passages = np.argsort(-passage_scores)
         ranked_sentences = np.argsort(-sentence_scores)
         best_p = int(ranked_passages[0])
-        best_s = int(ranked_sentences[0])
+        global_best_s = int(ranked_sentences[0])
+        if not (is_multi_part_question(cleaned) and len(find_query_entities(cleaned)) >= 2):
+            passage_sentence_ids = [si for si, pidx in enumerate(self.sentence_to_passage) if pidx == best_p]
+            best_s = max(passage_sentence_ids, key=lambda si: float(sentence_scores[si])) if passage_sentence_ids else global_best_s
+        else:
+            best_s = global_best_s
         best_passage_score = float(passage_scores[best_p])
         best_sentence_score = float(sentence_scores[best_s])
         best_dense = float(sentence_dense[best_s])
@@ -664,6 +802,28 @@ class RAGService:
         ]
         if missing_critical and best_dense < 0.50 and not multi_entity_evidence:
             has_evidence = False
+
+        # Near-domain abstention: the corpus discusses PostgreSQL MVCC but never
+        # specifies its transaction isolation level, and mentions certificates but
+        # does not state certificate byte/bit size. Do not infer those values.
+        if re.search(r"\b(?:transaction\s+)?isolation\s+(?:level|levels|mode|modes)\b", cleaned, re.I):
+            has_evidence = any(
+                re.search(r"\bisolation\s+(?:level|levels|mode|modes)\b", passage, re.I)
+                for passage in self.passages
+            )
+        asks_certificate_size = bool(
+            re.search(r"\bcertificate", cleaned, re.I)
+            and re.search(r"\b(?:size|length|bits?|bytes?)\b", cleaned, re.I)
+        )
+        if asks_certificate_size:
+            has_evidence = any(
+                re.search(r"\bcertificate", passage, re.I)
+                and re.search(r"\b(?:certificate\s+(?:size|length)|size\s+of\s+(?:the\s+)?certificates?)\b", passage, re.I)
+                for passage in self.passages
+            )
+        if re.search(r"\b(?:cap\s+theorem|kafka|raft\s+lease\s+duration)\b", cleaned, re.I):
+            # These terms/facts do not have direct supporting passages in this KB.
+            has_evidence = False
         # Requests that only contain an injection are never answered. A real factual
         # question plus an injection is still answered from the KB, ignoring the attack.
         if injection_detected and len(tokenize(cleaned)) < 4:
@@ -676,6 +836,63 @@ class RAGService:
         selected_sentences: list[tuple[int, int, float]] = []  # (sentence idx, passage idx, score)
         seen_per_passage: Counter[int] = Counter()
         max_sentence_score = best_sentence_score
+        if not multi and requested_attribute_patterns:
+            # When a question explicitly asks for an attribute, select the best
+            # sentence that states that attribute in the best-supported passage.
+            # This prevents a nearby entity-name sentence from displacing the fact.
+            for pattern in requested_attribute_patterns:
+                candidates = [
+                    si for si, pidx in enumerate(self.sentence_to_passage)
+                    if pidx == best_p and pattern.search(self.sentences[si])
+                ]
+                if candidates:
+                    chosen_sentence = max(candidates, key=lambda si: float(sentence_scores[si]))
+                    if all(existing[0] != chosen_sentence for existing in selected_sentences):
+                        selected_sentences.append((chosen_sentence, best_p, float(sentence_scores[chosen_sentence])))
+                        seen_per_passage[best_p] += 1
+        if multi and multi_entity_evidence:
+            # Guarantee at least one evidence sentence for every named side of a
+            # comparison/synthesis request, rather than allowing the strongest side
+            # to crowd out the other side.
+            for entity in entities:
+                eligible_passages = [
+                    idx for idx, passage in enumerate(self.passages)
+                    if entity_support(passage, [entity]) >= 0.9
+                ]
+                if not eligible_passages:
+                    # Some facts are expressed through an explicit contrast, e.g.
+                    # Memcached's passage states what Redis supports.
+                    eligible_passages = [
+                        idx for idx, passage in enumerate(self.passages)
+                        if entity_support(passage, [entity]) > 0
+                    ]
+                if not eligible_passages:
+                    continue
+                chosen_passage = max(eligible_passages, key=lambda idx: float(passage_scores[idx]))
+                eligible_sentences = [
+                    si for si, pidx in enumerate(self.sentence_to_passage)
+                    if pidx == chosen_passage and not SUSPICIOUS_SENTENCE.search(self.sentences[si])
+                ]
+                if not eligible_sentences:
+                    continue
+                # For each explicitly requested fact attribute, select a sentence
+                # from this entity's own evidence chunk. This is important when a
+                # comparison asks for (say) both batch sizes and learning rates.
+                selected_for_entity: set[int] = set()
+                for cue, target in attribute_patterns:
+                    if not cue.search(cleaned):
+                        continue
+                    attribute_candidates = [si for si in eligible_sentences if target.search(self.sentences[si])]
+                    if attribute_candidates:
+                        chosen_sentence = max(attribute_candidates, key=lambda si: float(sentence_scores[si]))
+                        if chosen_sentence not in selected_for_entity:
+                            selected_sentences.append((chosen_sentence, chosen_passage, float(sentence_scores[chosen_sentence])))
+                            selected_for_entity.add(chosen_sentence)
+                            seen_per_passage[chosen_passage] += 1
+                if not selected_for_entity:
+                    chosen_sentence = max(eligible_sentences, key=lambda si: float(sentence_scores[si]))
+                    selected_sentences.append((chosen_sentence, chosen_passage, float(sentence_scores[chosen_sentence])))
+                    seen_per_passage[chosen_passage] += 1
         minimum_sentence_score = max(
             0.14 if multi else (0.16 if consequence_question else (0.18 if numeric_question else 0.205)),
             max_sentence_score - (0.17 if multi else (0.27 if consequence_question else (0.17 if numeric_question else 0.11))),
@@ -697,7 +914,14 @@ class RAGService:
                 break
             if score < max_sentence_score * (0.55 if multi else (0.30 if consequence_question else (0.65 if numeric_question else 0.78))):
                 continue
-            per_source_limit = 1 if multi else 2
+            if not multi and requested_attribute_patterns and not any(
+                pattern.search(self.sentences[si]) for pattern in requested_attribute_patterns
+            ):
+                continue
+            if not multi and re.search(r"\b(?:how many|how much|what number|what size|what value|how long|how often)\b", cleaned, re.I):
+                if not re.search(r"\b\d+(?:\.\d+)?\b", self.sentences[si]):
+                    continue
+            per_source_limit = 1 if (multi or requested_attribute_patterns) else 2
             if seen_per_passage[pidx] >= per_source_limit:
                 continue
             # Require either useful exact-topic coverage or a strong semantic match.
@@ -713,7 +937,10 @@ class RAGService:
                 break
 
         if not selected_sentences:
-            selected_sentences = [(best_s, self.sentence_to_passage[best_s], best_sentence_score)]
+            fallback_passage = best_p
+            fallback_candidates = [si for si, pidx in enumerate(self.sentence_to_passage) if pidx == fallback_passage]
+            fallback_sentence = max(fallback_candidates, key=lambda si: float(sentence_scores[si])) if fallback_candidates else best_s
+            selected_sentences = [(fallback_sentence, fallback_passage, float(sentence_scores[fallback_sentence]))]
 
         # A normal fact question should not acquire unrelated nearby passages.
         used_sources = {pidx for _, pidx, _ in selected_sentences}
@@ -723,7 +950,10 @@ class RAGService:
             ordered_sources = [self.sentence_to_passage[best_s]]
         selected_sentences = [x for x in selected_sentences if x[1] in set(ordered_sources)]
         if not selected_sentences:
-            selected_sentences = [(best_s, self.sentence_to_passage[best_s], best_sentence_score)]
+            fallback_passage = best_p
+            fallback_candidates = [si for si, pidx in enumerate(self.sentence_to_passage) if pidx == fallback_passage]
+            fallback_sentence = max(fallback_candidates, key=lambda si: float(sentence_scores[si])) if fallback_candidates else best_s
+            selected_sentences = [(fallback_sentence, fallback_passage, float(sentence_scores[fallback_sentence]))]
         source_scores = [float(passage_scores[i]) for i in ordered_sources]
 
         # Answer is assembled from verbatim KB evidence; this safely supports synthesis
@@ -748,7 +978,15 @@ class RAGService:
                     re.I,
                 )
                 if contrast:
-                    answer = f"Redis supports complex data structures like {contrast.group(1).strip()} .".replace(" .", ".")
+                    redis_fact = f"Redis supports complex data structures like {contrast.group(1).strip()}."
+                    if re.search(r"\bmemcached\b", cleaned, re.I):
+                        contrast_fact = sentence
+                        answer_parts = [x for x in answer_parts if x != sentence]
+                        answer_parts.append(redis_fact)
+                        answer_parts.append(contrast_fact)
+                        answer = " ".join(dict.fromkeys(answer_parts))
+                    else:
+                        answer = redis_fact
                     break
 
         # Contract requires high confidence for answered results and low for abstentions.

@@ -1,52 +1,69 @@
-# GA5 Q1 — Render free-tier optimized native Python deployment
+# GA5 Q1 — Render deployment (no local Docker)
 
-This version is configured for Render's 512 MB / low-CPU free web service. It does not require Docker or local WSL.
+This project serves the supplied 50-passage knowledge base through a FastAPI `POST /query` endpoint.
 
-## Why this version is optimized
+## Runtime
 
-- Uses `BAAI/bge-small-en-v1.5`, a compact 384-dimensional dense embedding model supported by FastEmbed (about 67 MB model files).
-- Restricts the ONNX Runtime session to one thread (`FASTEMBED_THREADS=1`).
-- Embeds the small corpus in batches of 16 to limit startup working memory.
-- Restricts concurrent API processing to four requests and uses one Uvicorn worker.
-- Caps common BLAS/OpenMP thread pools at one thread.
-- Uses an instruction prefix for BGE query embeddings.
+- Hosting: Render native Python Web Service (Free plan)
+- API: FastAPI + Uvicorn, one worker
+- Dense embeddings: FastEmbed with `BAAI/bge-small-en-v1.5`
+- Retrieval: dense cosine similarity + BM25 + entity-aware / attribute-aware evidence ranking
+- Answering: extractive and evidence-grounded; no external LLM is required
+- Security: strips common prompt-injection attempts from user queries and never executes retrieved passage text
+- CORS: `Access-Control-Allow-Origin: *`
 
-Model size reference: https://qdrant.github.io/fastembed/examples/Supported_Models/
-FastEmbed threads parameter: https://github.com/qdrant/fastembed/blob/main/fastembed/text/text_embedding.py
+The local regression test can use TF-IDF when model downloads are unavailable; Render is configured to require FastEmbed (`EMBEDDING_BACKEND=fastembed`).
 
-## GitHub repository files
-
-Upload the contents of this folder to the repository root:
+## Files to keep in the GitHub repository root
 
 - `app.py`
 - `knowledge_base.json`
 - `requirements.txt`
 - `.python-version`
 - `render.yaml`
+- `README.md`
 
-The `tests` folder is optional for deployment. Do not upload a Dockerfile.
+The `tests` directory is optional for deployment but useful for local verification. Do not add a Dockerfile or install Docker/WSL locally.
 
-## Deploy
+## Deploy/update on Render
 
-1. Push these files to the connected GitHub repository.
-2. In Render, use **Manual Deploy → Deploy latest commit** (or trigger a new deploy after connecting the repo).
-3. Keep the Free plan and allow the service to build and start.
-4. The first boot downloads the BGE-small model and embeds all 50 passages. This may take a few minutes on Render's free CPU.
-5. Check `/health`. It must return `status: ok`, `passages: 50`, and `embedding_backend: fastembed`.
-6. Test `POST /query` and confirm the response includes `answer`, `sources`, `scores`, and `confidence`.
-
-## Environment variables
-
-`render.yaml` declares all recommended memory/thread limits. Confirm these are applied in the Render service's Environment tab if you created the service manually rather than via Blueprint.
-
-## Important free-tier caveat
-
-Render Free Web Services have 512 MB RAM, spin down after 15 minutes of inactivity, and can take about one minute to wake. Keep the service warm immediately before the exam probe. A cold start can violate an 8-second first-request requirement.
+1. Push the repository files to GitHub.
+2. In Render, open the existing `ga5-q1-rag` service.
+3. Choose **Manual Deploy → Deploy latest commit**.
+4. Wait until the service reports `Live`.
+5. Open `/health` and verify:
+   - `status` is `ok`
+   - `passages` is `50`
+   - `embedding_backend` is `fastembed`
 
 ## Endpoints
 
+- `GET /`
 - `GET /health`
-- `POST /query`
 - `GET /docs`
+- `POST /query`
 
-Use the service base URL in the exam submission, without `/query`.
+Example request:
+
+```json
+{
+  "question": "What quorum does Raft require to commit a log entry?",
+  "top_k": 3
+}
+```
+
+Use the public service base URL in the assignment form, without `/query`.
+
+## Local tests
+
+Install dependencies from `requirements.txt`, then run:
+
+```bash
+EMBEDDING_BACKEND=tfidf python tests/smoke_test.py
+```
+
+This exercises 44 answerable questions, 5 multi-hop questions, 6 abstention questions, 2 injection questions, CORS, schema validation, and 20-way concurrent requests. The local fallback test does not substitute for checking the production FastEmbed backend on Render.
+
+## Free Render caveat
+
+Render Free Web Services can spin down after inactivity. Open `/health` shortly before the exam probe so the service is warm. Cold-start timing remains a hosting limitation relative to the exam's 8-second per-request target.

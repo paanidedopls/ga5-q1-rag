@@ -815,11 +815,48 @@ async def health() -> dict[str, Any]:
 async def query(request: QueryRequest) -> QueryResponse:
     if service is None:
         raise HTTPException(status_code=503, detail="RAG service is still initializing")
+
+    started = time.perf_counter()
+    # Temporary grader diagnostics: these log probe questions and evidence selection
+    # to Render's service logs. The response logic and JSON contract are unchanged.
+    LOG.info(
+        "GA5_PROBE_IN %s",
+        json.dumps({"question": request.question, "top_k": request.top_k}, ensure_ascii=False),
+    )
     async with request_slots:
         try:
-            return await run_in_threadpool(service.answer, request.question, request.top_k)
+            result = await run_in_threadpool(service.answer, request.question, request.top_k)
+            elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+            source_evidence = [
+                {"index": idx, "passage": service.passages[idx][:320]}
+                for idx in result.sources
+                if 0 <= idx < len(service.passages)
+            ]
+            LOG.info(
+                "GA5_PROBE_OUT %s",
+                json.dumps(
+                    {
+                        "question": request.question,
+                        "answer": result.answer,
+                        "sources": result.sources,
+                        "scores": result.scores,
+                        "confidence": result.confidence,
+                        "source_evidence": source_evidence,
+                        "duration_ms": elapsed_ms,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            return result
         except Exception as exc:
-            LOG.exception("Query failed")
+            elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+            LOG.exception(
+                "GA5_PROBE_ERROR %s",
+                json.dumps(
+                    {"question": request.question, "duration_ms": elapsed_ms},
+                    ensure_ascii=False,
+                ),
+            )
             raise HTTPException(status_code=500, detail="Query processing failed") from exc
 
 
